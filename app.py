@@ -10,58 +10,76 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
-from curl_cffi import requests as cffi_requests
+import requests
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
+TIKTOK_HOST_RE = re.compile(r"(^|\.)tiktok\.com$", re.I)
 POST_ID_RE = re.compile(r"/(?:video|photo)/(\d+)")
+USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 "
+    "Mobile/15E148 Safari/604.1"
+)
 
 
-def valid_tiktok_url(url):
+def is_tiktok_url(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
-        return host.endswith("tiktok.com")
+        return bool(TIKTOK_HOST_RE.search(host)) or host in {"vm.tiktok.com", "vt.tiktok.com"}
     except Exception:
         return False
 
 
-def resolve_url(url):
-    r = cffi_requests.get(
-        url,
-        impersonate="chrome",
-        allow_redirects=True,
-        timeout=20,
-    )
+def make_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Accept": "*/*",
+    })
+    return s
+
+
+def resolve_tiktok_url(url: str, session: requests.Session):
+    r = session.get(url, allow_redirects=True, timeout=20)
     r.raise_for_status()
     return r.url, r.text
 
 
-def post_id_from_url(url):
+def post_id_from_url(url: str):
     m = POST_ID_RE.search(url)
     return m.group(1) if m else None
 
 
-def walk_for_item(obj, post_id):
+def recursive_find_item(obj, post_id):
     if isinstance(obj, dict):
-        if str(obj.get("id", "")) == str(post_id):
-            if "imagePost" in obj or "music" in obj or "video" in obj:
-                return obj
+        obj_id = str(obj.get("id", ""))
+
+        if obj_id == str(post_id) and (
+            "imagePost" in obj or "video" in obj or "music" in obj
+        ):
+            return obj
 
         module = obj.get("ItemModule")
-        if isinstance(module, dict):
-            x = module.get(str(post_id))
-            if isinstance(x, dict):
-                return x
 
-        for v in obj.values():
-            found = walk_for_item(v, post_id)
+        if isinstance(module, dict):
+            candidate = module.get(str(post_id))
+
+            if isinstance(candidate, dict):
+                return candidate
+
+        for value in obj.values():
+            found = recursive_find_item(value, post_id)
+
             if found:
                 return found
 
     elif isinstance(obj, list):
-        for v in obj:
-            found = walk_for_item(v, post_id)
+        for value in obj:
+            found = recursive_find_item(value, post_id)
+
             if found:
                 return found
 
@@ -76,83 +94,70 @@ def item_from_html(html, post_id):
     ]
 
     for pattern in patterns:
-        for match in re.finditer(pattern, html, re.I | re.S):
+        for match in re.finditer(pattern, html, flags=re.I | re.S):
+            raw = match.group(1).strip()
+
+            if not raw:
+                continue
+
             try:
-                data = json.loads(match.group(1))
+                data = json.loads(raw)
             except Exception:
                 continue
 
-            item = walk_for_item(data, post_id)
-            if item:
-                return item
+            found = recursive_find_item(data, post_id)
+
+            if found:
+                return found
 
     return None
 
 
-def ytdlp_info(url):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "impersonate": "chrome",
-    }
-
+def get_tiktok_item(final_url, html, post_id, session):
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception:
-        return None
-
-
-def get_item(final_url, html, post_id):
-    item = item_from_html(html, post_id)
-    if item:
-        return item
-
-    try:
-        r = cffi_requests.get(
+        r = session.get(
             "https://www.tiktok.com/api/item/detail/",
             params={"itemId": post_id},
             headers={"Referer": final_url},
-            impersonate="chrome",
             timeout=20,
         )
 
         if r.ok:
             data = r.json()
-            item = (
+
+            candidate = (
                 data.get("itemInfo", {}).get("itemStruct")
                 or data.get("itemStruct")
             )
 
-            if isinstance(item, dict):
-                return item
+            if isinstance(candidate, dict):
+                return candidate
 
     except Exception:
         pass
 
-    return None
+    return item_from_html(html, post_id)
 
 
-def collect_urls(value):
-    out = []
+def urls_from_value(value):
+    results = []
 
     if isinstance(value, str):
         if value.startswith(("http://", "https://")):
-            out.append(value)
+            results.append(value)
 
     elif isinstance(value, list):
         for x in value:
-            out.extend(collect_urls(x))
+            results.extend(urls_from_value(x))
 
     elif isinstance(value, dict):
         for x in value.values():
-            out.extend(collect_urls(x))
+            results.extend(urls_from_value(x))
 
-    return out
+    return results
 
 
-def unique(seq):
+def dedupe(seq):
     seen = set()
     out = []
 
@@ -164,128 +169,136 @@ def unique(seq):
     return out
 
 
-def image_url(image):
-    data = image.get("imageURL") or image.get("imageUrl") or image
-    urls = collect_urls(data)
+def best_image_url(image):
+    image_url = image.get("imageURL") or image.get("imageUrl") or image
+    urls = urls_from_value(image_url)
 
-    for url in urls:
-        if ".heic" not in url.lower():
-            return url
+    for u in urls:
+        low = u.lower()
+
+        if ".heic" not in low:
+            return u
 
     return urls[0] if urls else None
 
 
-def audio_urls_from_item(item):
+def collect_music_urls(item):
     music = item.get("music") or {}
     urls = []
 
     if isinstance(music, dict):
-        for key in (
+        direct_keys = [
             "playUrl",
             "play_url",
             "PlayUrl",
-            "audioUrl",
             "audioURL",
+            "audioUrl",
+            "audio_url",
             "downloadUrl",
             "download_url",
-        ):
-            urls.extend(collect_urls(music.get(key)))
+        ]
 
-        def walk(obj):
+        for key in direct_keys:
+            if key in music:
+                urls.extend(urls_from_value(music[key]))
+
+        def walk_audio_keys(obj):
             found = []
 
             if isinstance(obj, dict):
                 for k, v in obj.items():
-                    k = str(k).lower()
+                    kl = str(k).lower()
 
-                    if any(x in k for x in ("play", "audio", "download")):
-                        found.extend(collect_urls(v))
+                    if any(
+                        token in kl
+                        for token in ("play", "audio", "download", "musicurl")
+                    ):
+                        found.extend(urls_from_value(v))
 
                     if isinstance(v, (dict, list)):
-                        found.extend(walk(v))
+                        found.extend(walk_audio_keys(v))
 
             elif isinstance(obj, list):
                 for v in obj:
-                    found.extend(walk(v))
+                    found.extend(walk_audio_keys(v))
 
             return found
 
-        urls.extend(walk(music))
+        urls.extend(walk_audio_keys(music))
 
-    return [
-        u for u in unique(urls)
-        if not any(
-            ext in u.lower()
-            for ext in (".jpg", ".jpeg", ".png", ".webp", ".heic")
-        )
-    ]
+    for key in (
+        "musicPlayUrl",
+        "music_play_url",
+        "audioUrl",
+        "audioURL",
+    ):
+        if key in item:
+            urls.extend(urls_from_value(item[key]))
 
+    filtered = []
 
-def audio_urls_from_ytdlp(info):
-    urls = []
+    for u in dedupe(urls):
+        low = u.lower()
 
-    if not isinstance(info, dict):
-        return urls
-
-    for f in info.get("formats") or []:
-        if not isinstance(f, dict):
+        if any(
+            x in low
+            for x in (
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".heic",
+            )
+        ):
             continue
 
-        url = f.get("url")
-        acodec = f.get("acodec")
-        vcodec = f.get("vcodec")
+        filtered.append(u)
 
-        if url and acodec not in (None, "none"):
-            if (
-                vcodec in (None, "none")
-                or (
-                    f.get("width") in (0, None)
-                    and f.get("height") in (0, None)
-                )
-            ):
-                urls.append(url)
-
-    url = info.get("url")
-
-    if isinstance(url, str):
-        urls.append(url)
-
-    return unique(urls)
+    return filtered
 
 
-def download_file(url, path, referer):
-    r = cffi_requests.get(
+def download_binary(session, url, destination, referer):
+    with session.get(
         url,
-        headers={"Referer": referer},
-        impersonate="chrome",
+        headers={
+            "Referer": referer,
+            "User-Agent": USER_AGENT,
+        },
+        stream=True,
         timeout=30,
-    )
-    r.raise_for_status()
+    ) as r:
 
-    with open(path, "wb") as f:
-        f.write(r.content)
+        r.raise_for_status()
+
+        with open(destination, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
 
 
-def duration(path):
+def ffprobe_duration(path):
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+
     try:
-        p = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                path,
-            ],
-            capture_output=True,
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=20,
         )
 
-        if p.returncode == 0:
-            return float(p.stdout.strip())
+        if result.returncode == 0:
+            return float(result.stdout.strip())
 
     except Exception:
         pass
@@ -293,128 +306,175 @@ def duration(path):
     return 0.0
 
 
-def best_audio(item, ytdlp_data, final_url, temp_dir):
-    urls = unique(
-        audio_urls_from_item(item)
-        + audio_urls_from_ytdlp(ytdlp_data)
-    )
+def choose_best_music(item, final_url, temp_dir, session):
+    urls = collect_music_urls(item)
+
+    if not urls:
+        raise RuntimeError(
+            "TikTok n'a fourni aucune URL audio exploitable pour ce slideshow."
+        )
 
     best_path = None
     best_duration = 0.0
 
-    for i, url in enumerate(urls[:12]):
-        path = os.path.join(temp_dir, f"audio_{i}.bin")
+    for i, url in enumerate(urls[:8]):
+        path = os.path.join(
+            temp_dir,
+            f"music_candidate_{i}.bin",
+        )
 
         try:
-            download_file(url, path, final_url)
+            download_binary(
+                session,
+                url,
+                path,
+                final_url,
+            )
 
-            if os.path.getsize(path) < 1000:
+            if (
+                not os.path.exists(path)
+                or os.path.getsize(path) < 1000
+            ):
                 continue
 
-            d = duration(path)
+            duration = ffprobe_duration(path)
 
-            if d > best_duration:
-                best_duration = d
+            if duration > best_duration:
+                best_duration = duration
                 best_path = path
 
         except Exception:
-            pass
+            continue
 
-    if not best_path:
-        raise RuntimeError("La musique n'a pas pu être récupérée.")
+    if not best_path or best_duration < 1:
+        raise RuntimeError(
+            "La musique du TikTok n'a pas pu être récupérée correctement."
+        )
 
     return best_path, best_duration
 
 
-def create_slideshow(item, ytdlp_data, final_url, temp_dir):
-    images = (item.get("imagePost") or {}).get("images") or []
+def render_slideshow(
+    item,
+    final_url,
+    temp_dir,
+    session,
+):
+    image_post = item.get("imagePost") or {}
+    images = image_post.get("images") or []
 
-    urls = [
-        image_url(x)
-        for x in images
-        if isinstance(x, dict)
+    image_urls = [
+        best_image_url(img)
+        for img in images
+        if isinstance(img, dict)
     ]
 
-    urls = [x for x in urls if x]
+    image_urls = [
+        u
+        for u in image_urls
+        if u
+    ]
 
-    if not urls:
+    if not image_urls:
         raise RuntimeError(
-            "TikTok n'a pas fourni les photos du slideshow."
+            "TikTok n'a pas fourni les images de ce slideshow."
         )
 
-    urls = urls[:35]
-    files = []
+    image_urls = image_urls[:35]
 
-    for i, url in enumerate(urls):
-        p = os.path.join(
+    image_files = []
+
+    for i, image_url in enumerate(image_urls):
+        path = os.path.join(
             temp_dir,
             f"slide_{i:03d}.jpg",
         )
 
-        download_file(
-            url,
-            p,
+        download_binary(
+            session,
+            image_url,
+            path,
             final_url,
         )
 
-        files.append(p)
+        image_files.append(path)
 
-    audio, audio_duration = best_audio(
+    audio_path, actual_audio_duration = choose_best_music(
         item,
-        ytdlp_data,
         final_url,
         temp_dir,
+        session,
     )
 
-    if audio_duration < 1:
-        raise RuntimeError(
-            "La durée de la musique n'a pas pu être détectée."
-        )
+    meta_duration = 0.0
+    music = item.get("music") or {}
 
-    target_duration = min(
-        audio_duration,
-        180.0,
+    if isinstance(music, dict):
+        try:
+            meta_duration = float(
+                music.get("duration") or 0
+            )
+        except Exception:
+            meta_duration = 0.0
+
+    target_duration = actual_audio_duration
+
+    if (
+        2 <= meta_duration < actual_audio_duration
+    ):
+        target_duration = meta_duration
+
+    target_duration = max(
+        2.0,
+        min(target_duration, 180.0),
     )
 
-    per_slide = (
-        target_duration
-        / len(files)
+    seconds_per_slide = (
+        target_duration / len(image_files)
     )
 
-    concat = os.path.join(
+    concat_path = os.path.join(
         temp_dir,
         "slides.txt",
     )
 
-    def esc(p):
+    def esc(path):
         return (
-            p
+            path
             .replace("\\", "\\\\")
             .replace("'", "'\\''")
         )
 
     with open(
-        concat,
+        concat_path,
         "w",
         encoding="utf-8",
     ) as f:
 
-        for p in files:
+        for p in image_files:
             f.write(
                 f"file '{esc(p)}'\n"
             )
 
             f.write(
-                f"duration {per_slide:.6f}\n"
+                f"duration {seconds_per_slide:.6f}\n"
             )
 
         f.write(
-            f"file '{esc(files[-1])}'\n"
+            f"file '{esc(image_files[-1])}'\n"
         )
 
     output = os.path.join(
         temp_dir,
         "slideshow.mp4",
+    )
+
+    vf = (
+        "scale=1080:1920:"
+        "force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:"
+        "(ow-iw)/2:(oh-ih)/2,"
+        "format=yuv420p"
     )
 
     cmd = [
@@ -423,27 +483,19 @@ def create_slideshow(item, ytdlp_data, final_url, temp_dir):
 
         "-f",
         "concat",
-
         "-safe",
         "0",
+        "-i",
+        concat_path,
 
         "-i",
-        concat,
-
-        "-i",
-        audio,
+        audio_path,
 
         "-t",
         f"{target_duration:.3f}",
 
         "-vf",
-        (
-            "scale=1080:1920:"
-            "force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:"
-            "(ow-iw)/2:(oh-ih)/2,"
-            "format=yuv420p"
-        ),
+        vf,
 
         "-r",
         "30",
@@ -487,32 +539,54 @@ def create_slideshow(item, ytdlp_data, final_url, temp_dir):
         result.returncode != 0
         or not os.path.exists(output)
     ):
+        err = (
+            result.stderr or ""
+        )[-900:]
+
         raise RuntimeError(
-            "FFmpeg n'a pas réussi à créer le slideshow."
+            "FFmpeg n'a pas pu créer "
+            f"le slideshow avec musique. {err}"
+        )
+
+    final_duration = ffprobe_duration(output)
+
+    if final_duration < min(
+        target_duration * 0.85,
+        target_duration - 1,
+    ):
+        raise RuntimeError(
+            "La vidéo créée est trop courte "
+            f"({final_duration:.1f}s au lieu "
+            f"d'environ {target_duration:.1f}s)."
         )
 
     return (
         output,
-        len(files),
+        len(image_files),
         target_duration,
     )
 
 
-def normal_video(
+def download_normal_video(
     url,
     temp_dir,
 ):
+    outtmpl = os.path.join(
+        temp_dir,
+        "%(id)s.%(ext)s",
+    )
+
     opts = {
         "format": "bv*+ba/b",
         "merge_output_format": "mp4",
-        "outtmpl": os.path.join(
-            temp_dir,
-            "%(id)s.%(ext)s",
-        ),
+        "outtmpl": outtmpl,
+        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
-        "impersonate": "chrome",
+        "restrictfilenames": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 20,
     }
 
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -536,7 +610,7 @@ def normal_video(
 
     if not files:
         raise RuntimeError(
-            "Aucune vidéo n'a été récupérée."
+            "Aucun fichier vidéo n'a été récupéré."
         )
 
     mp4s = [
@@ -545,11 +619,17 @@ def normal_video(
         if p.lower().endswith(".mp4")
     ]
 
+    candidates = (
+        mp4s or files
+    )
+
+    file_path = max(
+        candidates,
+        key=os.path.getsize,
+    )
+
     return (
-        max(
-            mp4s or files,
-            key=os.path.getsize,
-        ),
+        file_path,
         info,
     )
 
@@ -570,7 +650,7 @@ def health():
 
 @app.post("/download")
 def download():
-    data = (
+    payload = (
         request.get_json(
             silent=True
         )
@@ -578,7 +658,7 @@ def download():
     )
 
     url = str(
-        data.get(
+        payload.get(
             "url",
             "",
         )
@@ -589,13 +669,13 @@ def download():
             error="Colle un lien TikTok."
         ), 400
 
-    if not valid_tiktok_url(url):
+    if not is_tiktok_url(url):
         return jsonify(
-            error="Lien TikTok invalide."
+            error="Ce lien ne semble pas venir de TikTok."
         ), 400
 
     temp_dir = tempfile.mkdtemp(
-        prefix="tiktok_"
+        prefix="tiktokdl_"
     )
 
     @after_this_request
@@ -610,95 +690,245 @@ def download():
         return response
 
     try:
-        final_url, html = resolve_url(
-            url
+        session = make_session()
+
+        final_url, html = resolve_tiktok_url(
+            url,
+            session,
         )
 
         post_id = post_id_from_url(
             final_url
         )
 
-        ytdlp_data = ytdlp_info(
-            final_url
+        is_photo_url = (
+            "/photo/" in final_url
         )
 
         item = None
 
         if post_id:
-            item = get_item(
+            item = get_tiktok_item(
                 final_url,
                 html,
                 post_id,
+                session,
             )
 
-        is_photo = (
-            "/photo/" in final_url
-        )
-
-        if is_photo:
+        if is_photo_url:
             if not isinstance(
                 item,
                 dict,
             ):
                 raise RuntimeError(
-                    "TikTok bloque encore "
-                    "les données du slideshow "
-                    "pour ce post."
+                    "Le post photo est détecté, "
+                    "mais TikTok n'a pas fourni "
+                    "les données nécessaires."
                 )
 
-            output, count, d = create_slideshow(
+            if not (
+                item.get("imagePost")
+                or {}
+            ).get("images"):
+                raise RuntimeError(
+                    "TikTok n'a pas fourni "
+                    "la liste complète des photos."
+                )
+
+            (
+                file_path,
+                count,
+                duration,
+            ) = render_slideshow(
                 item,
-                ytdlp_data,
                 final_url,
                 temp_dir,
+                session,
+            )
+
+            author = (
+                (
+                    item.get("author")
+                    or {}
+                ).get("uniqueId")
+                or "tiktok"
+            )
+
+            safe_author = (
+                re.sub(
+                    r"[^A-Za-z0-9._-]+",
+                    "_",
+                    str(author),
+                )
+                .strip("_")[:40]
+                or "tiktok"
             )
 
             filename = (
-                f"tiktok_{post_id}_"
+                f"{safe_author}_"
+                f"{post_id}_"
+                f"slideshow_"
                 f"{count}photos_"
-                f"{round(d)}s.mp4"
+                f"{round(duration)}s.mp4"
             )
 
             return send_file(
-                output,
+                file_path,
                 as_attachment=True,
                 download_name=filename,
                 mimetype="video/mp4",
+                conditional=True,
             )
 
-        video, info = normal_video(
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            and (
+                item.get("imagePost")
+                or {}
+            ).get("images")
+        ):
+            (
+                file_path,
+                count,
+                duration,
+            ) = render_slideshow(
+                item,
+                final_url,
+                temp_dir,
+                session,
+            )
+
+            author = (
+                (
+                    item.get("author")
+                    or {}
+                ).get("uniqueId")
+                or "tiktok"
+            )
+
+            safe_author = (
+                re.sub(
+                    r"[^A-Za-z0-9._-]+",
+                    "_",
+                    str(author),
+                )
+                .strip("_")[:40]
+                or "tiktok"
+            )
+
+            filename = (
+                f"{safe_author}_"
+                f"{post_id or 'photo'}_"
+                f"slideshow_"
+                f"{count}photos_"
+                f"{round(duration)}s.mp4"
+            )
+
+            return send_file(
+                file_path,
+                as_attachment=True,
+                download_name=filename,
+                mimetype="video/mp4",
+                conditional=True,
+            )
+
+        file_path, info = download_normal_video(
             final_url,
             temp_dir,
         )
 
+        video_id = str(
+            info.get("id")
+            or post_id
+            or "video"
+        )
+
+        uploader = str(
+            info.get("uploader")
+            or info.get("creator")
+            or "tiktok"
+        )
+
+        safe_uploader = (
+            re.sub(
+                r"[^A-Za-z0-9._-]+",
+                "_",
+                uploader,
+            )
+            .strip("_")[:40]
+            or "tiktok"
+        )
+
+        ext = (
+            Path(file_path).suffix
+            or ".mp4"
+        )
+
         filename = (
-            f"tiktok_"
-            f"{info.get('id', 'video')}"
-            f"{Path(video).suffix or '.mp4'}"
+            f"{safe_uploader}_"
+            f"{video_id}"
+            f"{ext}"
         )
 
         return send_file(
-            video,
+            file_path,
             as_attachment=True,
             download_name=filename,
+            mimetype=(
+                "video/mp4"
+                if ext.lower() == ".mp4"
+                else None
+            ),
+            conditional=True,
         )
 
-    except Exception as e:
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        return jsonify(
+            error=(
+                "Le slideshow est trop long "
+                "à convertir sur le serveur gratuit."
+            )
+        ), 504
+
+    except Exception as exc:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        msg = str(exc)
+
+        if len(msg) > 500:
+            msg = (
+                msg[:500]
+                + "…"
+            )
+
         return jsonify(
             error=(
                 "Téléchargement impossible. "
-                + str(e)[:500]
+                + msg
             )
         ), 500
 
 
 if __name__ == "__main__":
+    port = int(
+        os.environ.get(
+            "PORT",
+            "5000",
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                "5000",
-            )
-        ),
+        port=port,
     )
