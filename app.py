@@ -54,13 +54,11 @@ def post_id_from_url(url: str):
 
 
 def recursive_find_item(obj, post_id):
-    """Find a TikTok item dict inside TikTok's embedded page JSON."""
     if isinstance(obj, dict):
         obj_id = str(obj.get("id", ""))
-        if obj_id == str(post_id) and ("imagePost" in obj or "video" in obj):
+        if obj_id == str(post_id) and ("imagePost" in obj or "video" in obj or "music" in obj):
             return obj
 
-        # Common TikTok state shape: ItemModule: {POST_ID: {...}}
         module = obj.get("ItemModule")
         if isinstance(module, dict):
             candidate = module.get(str(post_id))
@@ -81,7 +79,6 @@ def recursive_find_item(obj, post_id):
 
 
 def item_from_html(html, post_id):
-    # TikTok has used several embedded JSON containers over time.
     patterns = [
         r'<script[^>]+id=["\']__UNIVERSAL_DATA_FOR_REHYDRATION__["\'][^>]*>(.*?)</script>',
         r'<script[^>]+id=["\']SIGI_STATE["\'][^>]*>(.*?)</script>',
@@ -103,7 +100,6 @@ def item_from_html(html, post_id):
 
 
 def get_tiktok_item(final_url, html, post_id, session):
-    # First try the same JSON endpoint used by TikTok's web experience.
     api_url = "https://www.tiktok.com/api/item/detail/"
     try:
         r = session.get(
@@ -123,30 +119,105 @@ def get_tiktok_item(final_url, html, post_id, session):
     except Exception:
         pass
 
-    # If TikTok rejects the endpoint, use the JSON already embedded in the page.
     return item_from_html(html, post_id)
 
 
+def first_http_url(value):
+    """Find the first useful http(s) URL inside a string/list/dict."""
+    if isinstance(value, str):
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        return None
+
+    if isinstance(value, list):
+        for x in value:
+            found = first_http_url(x)
+            if found:
+                return found
+
+    if isinstance(value, dict):
+        # Prefer common direct-url fields
+        for key in (
+            "urlList", "url_list", "playUrl", "play_url", "PlayUrl",
+            "downloadUrl", "download_url", "uri"
+        ):
+            if key in value:
+                found = first_http_url(value[key])
+                if found:
+                    return found
+
+        for x in value.values():
+            found = first_http_url(x)
+            if found:
+                return found
+
+    return None
+
+
 def best_image_url(image):
-    image_url = image.get("imageURL") or image.get("imageUrl") or {}
-    urls = image_url.get("urlList") or image_url.get("url_list") or []
+    image_url = image.get("imageURL") or image.get("imageUrl") or image
+    urls = []
+
+    if isinstance(image_url, dict):
+        urls = image_url.get("urlList") or image_url.get("url_list") or []
+    elif isinstance(image_url, list):
+        urls = image_url
+    elif isinstance(image_url, str):
+        urls = [image_url]
+
     if isinstance(urls, str):
         urls = [urls]
 
-    # Prefer formats FFmpeg commonly handles.
     for u in urls:
         if isinstance(u, str) and u.startswith("http") and ".heic" not in u.lower():
             return u
-    for u in urls:
-        if isinstance(u, str) and u.startswith("http"):
-            return u
+
+    return first_http_url(image_url)
+
+
+def extract_music_url(item):
+    """
+    TikTok has changed the exact music JSON shape several times.
+    Search likely fields first, then recursively search the music object.
+    """
+    music = item.get("music") or {}
+
+    candidates = [
+        music.get("playUrl"),
+        music.get("play_url"),
+        music.get("PlayUrl"),
+        music.get("audioURL"),
+        music.get("audioUrl"),
+        music.get("downloadUrl"),
+        music.get("download_url"),
+    ]
+
+    for c in candidates:
+        found = first_http_url(c)
+        if found:
+            return found
+
+    found = first_http_url(music)
+    if found:
+        return found
+
+    # Some page payloads expose audio URLs outside the "music" dict.
+    for key in ("musicPlayUrl", "music_play_url", "audioUrl", "audioURL"):
+        if key in item:
+            found = first_http_url(item[key])
+            if found:
+                return found
+
     return None
 
 
 def download_binary(session, url, destination, referer):
     with session.get(
         url,
-        headers={"Referer": referer},
+        headers={
+            "Referer": referer,
+            "User-Agent": USER_AGENT,
+        },
         stream=True,
         timeout=30,
     ) as r:
@@ -160,43 +231,47 @@ def download_binary(session, url, destination, referer):
 def render_slideshow(item, final_url, temp_dir, session):
     image_post = item.get("imagePost") or {}
     images = image_post.get("images") or []
+
     image_urls = [best_image_url(img) for img in images if isinstance(img, dict)]
     image_urls = [u for u in image_urls if u]
 
     if not image_urls:
-        raise RuntimeError("TikTok n'a pas fourni les images de ce slideshow.")
+        raise RuntimeError("Je dÃ©tecte bien un slideshow, mais TikTok n'a pas fourni les images.")
 
-    music = item.get("music") or {}
-    music_url = music.get("playUrl") or music.get("play_url")
+    music_url = extract_music_url(item)
     if not music_url:
-        raise RuntimeError("TikTok n'a pas fourni la musique de ce slideshow.")
+        raise RuntimeError(
+            "Je dÃ©tecte bien le slideshow, mais TikTok n'a pas fourni l'URL de la musique. "
+            "Essaie un autre slideshow pour vÃ©rifier si le problÃ¨me vient de ce post."
+        )
 
-    # Limit protects the small free server from pathological posts.
     image_urls = image_urls[:35]
 
     image_files = []
     for i, image_url in enumerate(image_urls):
-        path = os.path.join(temp_dir, f"slide_{i:03d}.img")
+        # Let FFmpeg inspect the actual format from the file content.
+        path = os.path.join(temp_dir, f"slide_{i:03d}.jpg")
         download_binary(session, image_url, path, final_url)
         image_files.append(path)
 
-    audio_path = os.path.join(temp_dir, "music.audio")
+    audio_path = os.path.join(temp_dir, "music.mp3")
     download_binary(session, music_url, audio_path, final_url)
 
-    # TikTok photo mode has no fixed automatic viewing time because users swipe.
-    # 2.5 s/image makes a conventional video export while preserving all slides.
+    # Verify the audio file is real before conversion.
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
+        raise RuntimeError("La musique TikTok n'a pas pu Ãªtre tÃ©lÃ©chargÃ©e correctement.")
+
     seconds_per_slide = 2.5
     concat_path = os.path.join(temp_dir, "slides.txt")
 
-    def ffconcat_escape(path):
+    def esc(path):
         return path.replace("\\", "\\\\").replace("'", "'\\''")
 
     with open(concat_path, "w", encoding="utf-8") as f:
         for p in image_files:
-            f.write(f"file '{ffconcat_escape(p)}'\n")
+            f.write(f"file '{esc(p)}'\n")
             f.write(f"duration {seconds_per_slide}\n")
-        # FFmpeg concat demuxer needs the final frame repeated.
-        f.write(f"file '{ffconcat_escape(image_files[-1])}'\n")
+        f.write(f"file '{esc(image_files[-1])}'\n")
 
     output = os.path.join(temp_dir, "slideshow.mp4")
     total_duration = len(image_files) * seconds_per_slide
@@ -210,7 +285,7 @@ def render_slideshow(item, final_url, temp_dir, session):
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", concat_path,
-        "-i", audio_path,
+        "-stream_loop", "-1", "-i", audio_path,
         "-t", f"{total_duration:.2f}",
         "-vf", vf,
         "-r", "30",
@@ -219,7 +294,6 @@ def render_slideshow(item, final_url, temp_dir, session):
         "-crf", "20",
         "-c:a", "aac",
         "-b:a", "192k",
-        "-shortest",
         "-movflags", "+faststart",
         output,
     ]
@@ -231,9 +305,10 @@ def render_slideshow(item, final_url, temp_dir, session):
         text=True,
         timeout=180,
     )
+
     if result.returncode != 0 or not os.path.exists(output):
-        err = (result.stderr or "")[-800:]
-        raise RuntimeError(f"FFmpeg n'a pas pu crÃ©er la vidÃ©o. {err}")
+        err = (result.stderr or "")[-900:]
+        raise RuntimeError(f"FFmpeg n'a pas pu crÃ©er le slideshow avec musique. {err}")
 
     return output, len(image_files)
 
@@ -261,8 +336,8 @@ def download_normal_video(url, temp_dir):
         if os.path.isfile(p)
         and not p.endswith(".part")
         and not p.endswith(".txt")
-        and Path(p).name != "music.audio"
     ]
+
     if not files:
         raise RuntimeError("Aucun fichier vidÃ©o n'a Ã©tÃ© rÃ©cupÃ©rÃ©.")
 
@@ -303,18 +378,31 @@ def download():
         session = make_session()
         final_url, html = resolve_tiktok_url(url, session)
         post_id = post_id_from_url(final_url)
+        is_photo_url = "/photo/" in final_url
 
-        # Detect Photo Mode before yt-dlp: yt-dlp still has incomplete support
-        # for TikTok photo posts, whereas TikTok page data includes imagePost.
         item = None
         if post_id:
             item = get_tiktok_item(final_url, html, post_id, session)
 
-        if isinstance(item, dict) and (item.get("imagePost") or {}).get("images"):
+        # For /photo/ links, NEVER fall back to yt-dlp's single-image output.
+        if is_photo_url:
+            if not isinstance(item, dict):
+                raise RuntimeError(
+                    "Le lien est bien un TikTok Photo Mode, mais TikTok n'a pas fourni "
+                    "les donnÃ©es nÃ©cessaires au serveur."
+                )
+
+            if not (item.get("imagePost") or {}).get("images"):
+                raise RuntimeError(
+                    "TikTok a renvoyÃ© ce post sans la liste complÃ¨te des photos."
+                )
+
             file_path, count = render_slideshow(item, final_url, temp_dir, session)
+
             author = (item.get("author") or {}).get("uniqueId") or "tiktok"
             safe_author = re.sub(r"[^A-Za-z0-9._-]+", "_", str(author)).strip("_")[:40] or "tiktok"
             filename = f"{safe_author}_{post_id}_slideshow_{count}photos.mp4"
+
             return send_file(
                 file_path,
                 as_attachment=True,
@@ -323,8 +411,24 @@ def download():
                 conditional=True,
             )
 
-        # Normal TikTok video
+        # Also handle image posts even if the resolved URL isn't /photo/.
+        if isinstance(item, dict) and (item.get("imagePost") or {}).get("images"):
+            file_path, count = render_slideshow(item, final_url, temp_dir, session)
+
+            author = (item.get("author") or {}).get("uniqueId") or "tiktok"
+            safe_author = re.sub(r"[^A-Za-z0-9._-]+", "_", str(author)).strip("_")[:40] or "tiktok"
+            filename = f"{safe_author}_{post_id or 'photo'}_slideshow_{count}photos.mp4"
+
+            return send_file(
+                file_path,
+                as_attachment=True,
+                download_name=filename,
+                mimetype="video/mp4",
+                conditional=True,
+            )
+
         file_path, info = download_normal_video(final_url, temp_dir)
+
         video_id = str(info.get("id") or post_id or "video")
         uploader = str(info.get("uploader") or info.get("creator") or "tiktok")
         safe_uploader = re.sub(r"[^A-Za-z0-9._-]+", "_", uploader).strip("_")[:40] or "tiktok"
@@ -345,8 +449,8 @@ def download():
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
         msg = str(exc)
-        if len(msg) > 450:
-            msg = msg[:450] + "â¦"
+        if len(msg) > 500:
+            msg = msg[:500] + "â¦"
         return jsonify(error=f"TÃ©lÃ©chargement impossible. {msg}"), 500
 
 
