@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: tiktok-hd-mobile
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
